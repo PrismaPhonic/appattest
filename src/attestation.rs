@@ -9,12 +9,12 @@ use openssl::{
     stack::Stack,
     x509::{store::X509StoreBuilder, X509StoreContext, X509},
 };
+#[cfg(feature = "reqwest")]
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 #[cfg(feature = "reqwest")]
 use std::time::Duration;
-#[cfg(feature = "reqwest")]
-use reqwest::blocking::Client;
 
 use der_parser::{ber::BerObjectContent, oid::Oid, parse_ber};
 use x509_parser::prelude::*;
