@@ -263,9 +263,8 @@ fn build_cred_cert(
     //       04 20    OCTET STRING, length 32
     //         <nonce bytes>
     //
-    // The verifier calls parse_ber on this, finds the [1] item as Unknown, and
-    // returns data[2..] which strips the 04 20 header to yield the raw 32-byte
-    // nonce.
+    // `extract_nonce_from_cert` walks this with `der_unwrap_tag`, stripping the
+    // 04 20 header to yield the raw 32-byte nonce.
     let mut ext_value = Vec::with_capacity(38);
     ext_value.extend_from_slice(&[0x30, 0x24, 0xa1, 0x22, 0x04, 0x20]);
     ext_value.extend_from_slice(nonce);

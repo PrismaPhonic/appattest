@@ -8,10 +8,6 @@ use std::time::Duration;
 use arrayvec::ArrayVec;
 use aws_lc_rs::digest::{digest, Context as DigestContext, SHA256};
 use x509_parser::prelude::*;
-// Use der_parser re-exported by x509_parser (der-parser v10, asn1-rs v0.7.1).
-// Importing directly avoids a version conflict with the older der-parser that
-// x509_parser::prelude::* also brings into scope via `pub use crate::*`.
-use x509_parser::der_parser::{ber::BerObjectContent, oid::Oid, parse_ber};
 
 use rustls_pki_types::{CertificateDer, UnixTime};
 use webpki::{
@@ -20,6 +16,101 @@ use webpki::{
 
 const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 const PEM_END: &str = "-----END CERTIFICATE-----";
+
+/// Read a DER TLV length field starting at `buf[pos]`.
+/// Returns `(length, bytes_consumed)` or `None` if the buffer is too short.
+fn der_read_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let b = *buf.get(pos)?;
+    if b < 0x80 {
+        Some((b as usize, 1))
+    } else {
+        let n = (b & 0x7f) as usize;
+        if n == 0 || n > 4 || pos + n >= buf.len() {
+            return None;
+        }
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | (*buf.get(pos + 1 + i)? as usize);
+        }
+        Some((len, 1 + n))
+    }
+}
+
+/// If `buf` starts with a DER TLV whose tag matches `expected_tag`,
+/// return a slice of its value bytes. Otherwise return `None`.
+fn der_unwrap_tag(buf: &[u8], expected_tag: u8) -> Option<&[u8]> {
+    if buf.first()? != &expected_tag {
+        return None;
+    }
+    let (len, consumed) = der_read_len(buf, 1)?;
+    let start = 1 + consumed;
+    buf.get(start..start + len)
+}
+
+/// Walk the DER Extensions in `cert_der` and return the raw value bytes
+/// (contents of the extnValue OCTET STRING) for the first extension whose
+/// OID matches `target_oid_bytes` (the raw DER OID value bytes, without tag/length).
+///
+/// Returns `None` if the extension is not present or the certificate cannot be parsed.
+fn der_find_extension<'a>(cert_der: &'a [u8], target_oid_bytes: &[u8]) -> Option<&'a [u8]> {
+    // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { ... } ... }
+    let cert_seq = der_unwrap_tag(cert_der, 0x30)?;
+    // TBSCertificate is the first item inside the outer SEQUENCE.
+    let tbs_seq = der_unwrap_tag(cert_seq, 0x30)?;
+
+    // Walk TBSCertificate fields until we find the [3] EXPLICIT extensions tag (0xa3).
+    let mut pos = 0;
+    while pos < tbs_seq.len() {
+        let tag = *tbs_seq.get(pos)?;
+        let (len, consumed) = der_read_len(tbs_seq, pos + 1)?;
+        let value_start = pos + 1 + consumed;
+        let value_end = value_start + len;
+        if value_end > tbs_seq.len() {
+            return None;
+        }
+        if tag == 0xa3 {
+            // Found [3] EXPLICIT - its contents are a SEQUENCE OF Extension.
+            let exts_seq = der_unwrap_tag(&tbs_seq[value_start..value_end], 0x30)?;
+            return der_scan_extensions(exts_seq, target_oid_bytes);
+        }
+        pos = value_end;
+    }
+    None
+}
+
+/// Scan a DER SEQUENCE OF Extension bodies for a matching OID.
+/// Returns the raw bytes of the matching extension's extnValue OCTET STRING contents.
+fn der_scan_extensions<'a>(exts: &'a [u8], target_oid_bytes: &[u8]) -> Option<&'a [u8]> {
+    let mut pos = 0;
+    while pos < exts.len() {
+        // Each Extension is a SEQUENCE.
+        let ext_seq = der_unwrap_tag(&exts[pos..], 0x30)?;
+        let (len, consumed) = der_read_len(exts, pos + 1)?;
+        let ext_end = pos + 1 + consumed + len;
+
+        // First field in Extension SEQUENCE is the OID.
+        if ext_seq.first()? == &0x06 {
+            let (oid_len, oid_consumed) = der_read_len(ext_seq, 1)?;
+            let oid_bytes = ext_seq.get(1 + oid_consumed..1 + oid_consumed + oid_len)?;
+            if oid_bytes == target_oid_bytes {
+                // Found it. The last field in the Extension SEQUENCE is the
+                // extnValue OCTET STRING. Unwrap it to get the raw value bytes.
+                let rest = &ext_seq[1 + oid_consumed + oid_len..];
+                // Skip optional critical BOOLEAN if present (tag 0x01).
+                let value_start = if rest.first() == Some(&0x01) {
+                    let (bl, bc) = der_read_len(rest, 1)?;
+                    1 + bc + bl
+                } else {
+                    0
+                };
+                let octet_str_contents = der_unwrap_tag(&rest[value_start..], 0x04)?;
+                return Some(octet_str_contents);
+            }
+        }
+        pos = ext_end;
+    }
+    None
+}
 
 /// Maximum DER size for a root CA certificate. The real Apple App Attestation
 /// Root CA is 549 bytes; the test CA is 571 bytes. 640 gives comfortable margin.
@@ -248,10 +339,13 @@ impl<'a> Attestation<'a> {
             .map_err(|e| AppAttestError::Message(format!("invalid root cert: {}", e)))?;
 
         let leaf_der = CertificateDer::from(certificates[0]);
-        let intermediates: Vec<CertificateDer<'_>> = certificates[1..]
-            .iter()
-            .map(|c| CertificateDer::from(*c))
-            .collect();
+        // At most 2 intermediates (Apple's chain: leaf + intermediate + root, root is the trust anchor).
+        let mut intermediates: ArrayVec<CertificateDer<'_>, 2> = ArrayVec::new();
+        for c in &certificates[1..] {
+            intermediates
+                .try_push(CertificateDer::from(*c))
+                .map_err(|_| AppAttestError::Message("too many intermediate certs".to_string()))?;
+        }
 
         let leaf = EndEntityCert::try_from(&leaf_der)
             .map_err(|e| AppAttestError::Message(format!("invalid leaf cert: {}", e)))?;
@@ -271,46 +365,33 @@ impl<'a> Attestation<'a> {
     }
 
     /// Extracts the nonce from the credential certificate's extension.
+    ///
+    /// Walks the DER TLV structure directly - no heap allocation. The nonce
+    /// lives at OID 1.2.840.113635.100.8.2 inside a SEQUENCE > [1] EXPLICIT
+    /// > OCTET STRING (32 bytes).
     fn extract_nonce_from_cert(cert_der: &[u8]) -> Result<[u8; 32], AppAttestError> {
-        let (_, cert) = parse_x509_certificate(cert_der)
-            .map_err(|_| AppAttestError::Message("Failed to parse certificate".to_string()))?;
+        // DER OID bytes for 1.2.840.113635.100.8.2
+        const CRED_CERT_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x08, 0x02];
 
-        let cred_cert_oid = Oid::from(&[1, 2, 840, 113635, 100, 8, 2])
-            .map_err(|_| AppAttestError::Message("Failed to parse OID".to_string()))?;
+        let ext_value = der_find_extension(cert_der, CRED_CERT_OID).ok_or(
+            AppAttestError::Message("Certificate did not contain credCert extension".to_string()),
+        )?;
 
-        let extensions: &[X509Extension] = cert.extensions();
-        let extension_value = extensions
-            .iter()
-            .find(|ext| ext.oid == cred_cert_oid)
-            .ok_or(AppAttestError::Message(
-                "Certificate did not contain credCert extension".to_string(),
-            ))?
-            .value;
+        // ext_value is the raw bytes of the extension's extnValue OCTET STRING contents.
+        // Structure: SEQUENCE { [1] EXPLICIT { OCTET STRING (32 bytes) } }
+        let seq = der_unwrap_tag(ext_value, 0x30).ok_or(AppAttestError::ExpectedASN1Node)?;
+        // [1] EXPLICIT context tag = 0xa1
+        let ctx = der_unwrap_tag(seq, 0xa1).ok_or(AppAttestError::ExpectedASN1Node)?;
+        // OCTET STRING tag = 0x04, length = 0x20 (32)
+        let nonce_bytes =
+            der_unwrap_tag(ctx, 0x04).ok_or(AppAttestError::ExpectedOctetStringInsideASN1Node)?;
 
-        let (_, raw_value) =
-            parse_ber(extension_value).map_err(|_| AppAttestError::ExpectedASN1Node)?;
-
-        if let BerObjectContent::Sequence(seq) = &raw_value.content {
-            for obj in seq {
-                match &obj.content {
-                    BerObjectContent::Unknown(unknown_obj) => {
-                        // Ref: https://cs.opensource.google/go/go/+/refs/tags/go1.22.4:src/encoding/asn1/asn1.go;l=530
-                        let offset: usize = 2;
-                        let nonce_bytes = &unknown_obj.data[offset..];
-                        return nonce_bytes.try_into().map_err(|_| {
-                            AppAttestError::Message(format!(
-                                "expected 32-byte nonce in credCert extension, got {}",
-                                nonce_bytes.len()
-                            ))
-                        });
-                    }
-                    _ => continue,
-                }
-            }
-            Err(AppAttestError::FailedToExtractValueFromASN1Node)
-        } else {
-            Err(AppAttestError::ExpectedASN1Node)
-        }
+        nonce_bytes.try_into().map_err(|_| {
+            AppAttestError::Message(format!(
+                "expected 32-byte nonce in credCert extension, got {}",
+                nonce_bytes.len()
+            ))
+        })
     }
 
     /// Creates a SHA-256 hash of the challenge string.
@@ -365,7 +446,7 @@ impl<'a> Attestation<'a> {
         app_id: &str,
         key_id: &str,
         apple_root_cert_pem: &[u8],
-    ) -> Result<([u8; 65], Vec<u8>), AppAttestError> {
+    ) -> Result<([u8; 65], &'a [u8]), AppAttestError> {
         self.verify_with_cert(challenge, app_id, key_id, apple_root_cert_pem)
     }
 
@@ -384,7 +465,7 @@ impl<'a> Attestation<'a> {
         app_id: &str,
         key_id: &str,
         apple_root_cert_pem: &[u8],
-    ) -> Result<([u8; 65], Vec<u8>), AppAttestError> {
+    ) -> Result<([u8; 65], &'a [u8]), AppAttestError> {
         // Step 1: Verify Certificates
         Attestation::verify_certificates(&self.certificates, apple_root_cert_pem)?;
 
@@ -395,13 +476,18 @@ impl<'a> Attestation<'a> {
         let client_data_hash = Attestation::client_data_hash(challenge);
         let nonce = Attestation::nonce_hash(self.auth_data, client_data_hash);
 
-        let key_id_decoded_bytes: Vec<u8> = BASE64_STANDARD
-            .decode(key_id)
-            .map_err(|e| AppAttestError::Message(e.to_string()))?;
+        // key_id is always SHA-256 of the public key - exactly 32 decoded bytes.
+        let mut key_id_buf = [0u8; 32];
+        let key_id_len = BASE64_STANDARD
+            .decode_slice(key_id, &mut key_id_buf)
+            .map_err(|_| AppAttestError::Message("key_id base64 decode failed".to_string()))?;
+        if key_id_len != 32 {
+            return Err(AppAttestError::InvalidPublicKey);
+        }
 
         // Step 4: Verify Public Key Hash
         let (public_key_bytes, hash_matches) =
-            Attestation::verify_public_key_hash(self.certificates[0], &key_id_decoded_bytes)?;
+            Attestation::verify_public_key_hash(self.certificates[0], &key_id_buf)?;
         if !hash_matches {
             return Err(AppAttestError::InvalidPublicKey);
         }
@@ -423,9 +509,9 @@ impl<'a> Attestation<'a> {
         }
 
         // Step 8: Verify Credential ID
-        auth_data.verify_key_id(&key_id_decoded_bytes)?;
+        auth_data.verify_key_id(&key_id_buf)?;
 
-        Ok((public_key_bytes, self.receipt.to_vec()))
+        Ok((public_key_bytes, self.receipt))
     }
 
     /// If any of the supplied app IDs verifies, returns `(app_id, public_key_bytes, receipt)`.
@@ -439,7 +525,7 @@ impl<'a> Attestation<'a> {
         challenge: &str,
         app_ids: &[&'static str],
         key_id: &str,
-    ) -> Result<(&'static str, [u8; 65], Vec<u8>), AppAttestError> {
+    ) -> Result<(&'static str, [u8; 65], &'a [u8]), AppAttestError> {
         let cert_pem = Attestation::fetch_apple_root_cert(
             "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem",
         )?;
@@ -456,7 +542,7 @@ impl<'a> Attestation<'a> {
         app_ids: &[&'static str],
         key_id: &str,
         apple_root_cert_pem: &[u8],
-    ) -> Result<(&'static str, [u8; 65], Vec<u8>), AppAttestError> {
+    ) -> Result<(&'static str, [u8; 65], &'a [u8]), AppAttestError> {
         // Step 1: Verify Certificates
         Attestation::verify_certificates(&self.certificates, apple_root_cert_pem)?;
 
@@ -467,13 +553,18 @@ impl<'a> Attestation<'a> {
         let client_data_hash = Attestation::client_data_hash(challenge);
         let nonce = Attestation::nonce_hash(self.auth_data, client_data_hash);
 
-        let key_id_decoded_bytes: Vec<u8> = BASE64_STANDARD
-            .decode(key_id)
-            .map_err(|e| AppAttestError::Message(e.to_string()))?;
+        // key_id is always SHA-256 of the public key - exactly 32 decoded bytes.
+        let mut key_id_buf = [0u8; 32];
+        let key_id_len = BASE64_STANDARD
+            .decode_slice(key_id, &mut key_id_buf)
+            .map_err(|_| AppAttestError::Message("key_id base64 decode failed".to_string()))?;
+        if key_id_len != 32 {
+            return Err(AppAttestError::InvalidPublicKey);
+        }
 
         // Step 4: Verify Public Key Hash
         let (public_key_bytes, hash_matches) =
-            Attestation::verify_public_key_hash(self.certificates[0], &key_id_decoded_bytes)?;
+            Attestation::verify_public_key_hash(self.certificates[0], &key_id_buf)?;
         if !hash_matches {
             return Err(AppAttestError::InvalidPublicKey);
         }
@@ -503,9 +594,9 @@ impl<'a> Attestation<'a> {
         }
 
         // Step 8: Verify Credential ID
-        auth_data.verify_key_id(&key_id_decoded_bytes)?;
+        auth_data.verify_key_id(&key_id_buf)?;
 
-        Ok((verified_app_id, public_key_bytes, self.receipt.to_vec()))
+        Ok((verified_app_id, public_key_bytes, self.receipt))
     }
 }
 
