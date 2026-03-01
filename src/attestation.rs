@@ -1,26 +1,35 @@
 use crate::{authenticator::AuthenticatorData, error::AppAttestError};
-use base64::{engine::general_purpose, Engine};
-use openssl::{
-    bn::BigNumContext,
-    ec::PointConversionForm,
-    hash::{hash, MessageDigest},
-    sha::Sha256,
-    stack::Stack,
-    x509::{store::X509StoreBuilder, X509StoreContext, X509},
-};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 #[cfg(feature = "reqwest")]
 use reqwest::blocking::Client;
 #[cfg(feature = "reqwest")]
 use std::time::Duration;
 
-use der_parser::{ber::BerObjectContent, oid::Oid, parse_ber};
+use arrayvec::ArrayVec;
+use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
+// Use der_parser re-exported by x509_parser (der-parser v10, asn1-rs v0.7.1).
+// Importing directly avoids a version conflict with the older der-parser that
+// x509_parser::prelude::* also brings into scope via `pub use crate::*`.
+use x509_parser::der_parser::{ber::BerObjectContent, oid::Oid, parse_ber};
+
+use rustls_pki_types::{CertificateDer, UnixTime};
+use webpki::{
+    anchor_from_trusted_cert, EndEntityCert, KeyUsage as WebpkiKeyUsage, ALL_VERIFICATION_ALGS,
+};
+
+const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const PEM_END: &str = "-----END CERTIFICATE-----";
+
+/// Maximum DER size for a root CA certificate. The real Apple App Attestation
+/// Root CA is 549 bytes; the test CA is 571 bytes. 640 gives comfortable margin.
+const MAX_ROOT_DER_SIZE: usize = 640;
 
 pub struct Attestation<'a> {
     /// DER-encoded certificate slices, borrowed from the decoded buffer.
     /// certificates[0] is the credential cert; certificates[1..] are
-    /// intermediates.
-    certificates: Vec<&'a [u8]>,
+    /// intermediates. Apple's chain has at most 3 certs (leaf + 2 intermediates).
+    certificates: ArrayVec<&'a [u8], 3>,
     /// Receipt bytes, borrowed from the decoded buffer.
     receipt: &'a [u8],
     /// Authenticator data bytes, borrowed from the decoded buffer.
@@ -36,7 +45,7 @@ impl<'a> Attestation<'a> {
             .map()
             .map_err(|_| AppAttestError::Message("expected CBOR map".to_string()))?;
 
-        let mut certificates: Option<Vec<&'a [u8]>> = None;
+        let mut certificates: Option<ArrayVec<&'a [u8], 3>> = None;
         let mut receipt: Option<&'a [u8]> = None;
         let mut auth_data: Option<&'a [u8]> = None;
 
@@ -61,14 +70,21 @@ impl<'a> Attestation<'a> {
                                     AppAttestError::Message("expected array for x5c".to_string())
                                 })?;
                                 let cert_count = arr_len.unwrap_or(0) as usize;
-                                let mut certs: Vec<&'a [u8]> = Vec::with_capacity(cert_count);
+                                if cert_count > 3 {
+                                    return Err(AppAttestError::Message(format!(
+                                        "x5c contains {} certificates; Apple's chain has at most 3",
+                                        cert_count
+                                    )));
+                                }
+                                let mut certs: ArrayVec<&'a [u8], 3> = ArrayVec::new();
                                 for _ in 0..cert_count {
                                     let cert_bytes = decoder.bytes().map_err(|_| {
                                         AppAttestError::Message(
                                             "expected bytes for certificate".to_string(),
                                         )
                                     })?;
-                                    certs.push(cert_bytes);
+                                    // Safety: cert_count <= 3, so push cannot overflow.
+                                    unsafe { certs.push_unchecked(cert_bytes) };
                                 }
                                 certificates = Some(certs);
                             }
@@ -138,7 +154,7 @@ impl<'a> Attestation<'a> {
     /// # Errors
     /// Returns `AppAttestError` if Base64 decoding fails.
     pub fn decode_base64(base64_attestation: &str) -> Result<Vec<u8>, AppAttestError> {
-        general_purpose::STANDARD
+        BASE64_STANDARD
             .decode(base64_attestation)
             .map_err(|e| AppAttestError::Message(format!("Failed to decode Base64: {}", e)))
     }
@@ -154,7 +170,7 @@ impl<'a> Attestation<'a> {
 
     /// Fetches the Apple root certificate from the specified URL.
     #[cfg(feature = "reqwest")]
-    fn fetch_apple_root_cert(url: &str) -> Result<X509, AppAttestError> {
+    fn fetch_apple_root_cert(url: &str) -> Result<Vec<u8>, AppAttestError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -172,60 +188,84 @@ impl<'a> Attestation<'a> {
             )));
         }
 
-        let cert_data = response
-            .text()
-            .map_err(|e| AppAttestError::Message(format!("Failed to read response text: {}", e)))?;
-
-        let cert = X509::from_pem(cert_data.as_bytes())
-            .map_err(|e| AppAttestError::Message(format!("Failed to parse certificate: {}", e)))?;
-
-        Ok(cert)
+        response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| AppAttestError::Message(format!("Failed to read response body: {}", e)))
     }
 
-    /// Verifies the certificate chain in the attestation statement.
+    /// Decode a single PEM certificate into DER bytes on the stack.
+    ///
+    /// Returns a `([u8; MAX_ROOT_DER_SIZE], usize)` pair; use `&buf[..len]`
+    /// to get the actual DER slice. No heap allocation occurs.
+    fn pem_to_der(pem: &[u8]) -> Result<([u8; MAX_ROOT_DER_SIZE], usize), AppAttestError> {
+        let pem_str = std::str::from_utf8(pem)
+            .map_err(|_| AppAttestError::Message("root cert PEM is not valid UTF-8".to_string()))?;
+        let start = pem_str
+            .find(PEM_BEGIN)
+            .ok_or_else(|| AppAttestError::Message("no BEGIN CERTIFICATE in PEM".to_string()))?
+            + PEM_BEGIN.len();
+        let stop = pem_str
+            .find(PEM_END)
+            .ok_or_else(|| AppAttestError::Message("no END CERTIFICATE in PEM".to_string()))?;
+        let b64_with_whitespace = &pem_str[start..stop];
+
+        // Strip whitespace into a temporary stack buffer before decoding.
+        // Max base64 length for MAX_ROOT_DER_SIZE bytes of DER is ceil(640*4/3) = 854.
+        let mut b64_buf = [0u8; 854];
+        let mut b64_len = 0usize;
+        for b in b64_with_whitespace.bytes() {
+            if !b.is_ascii_whitespace() {
+                if b64_len >= b64_buf.len() {
+                    return Err(AppAttestError::Message(
+                        "PEM base64 body too large for root CA buffer".to_string(),
+                    ));
+                }
+                b64_buf[b64_len] = b;
+                b64_len += 1;
+            }
+        }
+
+        let mut der_buf = [0u8; MAX_ROOT_DER_SIZE];
+        let written = BASE64_STANDARD
+            .decode_slice(&b64_buf[..b64_len], &mut der_buf)
+            .map_err(|e| AppAttestError::Message(format!("PEM base64 decode failed: {}", e)))?;
+        Ok((der_buf, written))
+    }
+
+    /// Verifies the certificate chain in the attestation statement using rustls-webpki.
     fn verify_certificates(
         certificates: &[&[u8]],
-        apple_root_cert: &X509,
+        apple_root_cert_pem: &[u8],
     ) -> Result<(), AppAttestError> {
         if certificates.is_empty() {
             return Err(AppAttestError::Message("certificates is empty".to_string()));
         }
-        let mut certs: Vec<X509> = Vec::with_capacity(certificates.len());
-        for cert_der in certificates {
-            let cert = X509::from_der(cert_der).map_err(|e| {
-                AppAttestError::Message(format!("Failed to parse certificate DER: {}", e))
-            })?;
-            certs.push(cert);
-        }
 
-        let mut store_builder = X509StoreBuilder::new()
-            .map_err(|e| AppAttestError::Message(format!("Failed to create X509 store: {}", e)))?;
-        store_builder
-            .add_cert(apple_root_cert.clone())
-            .map_err(|e| {
-                AppAttestError::Message(format!("Failed to add root cert to store: {}", e))
-            })?;
-        let store = store_builder.build();
+        let (root_der_buf, root_der_len) = Self::pem_to_der(apple_root_cert_pem)?;
+        let root_cert_der = CertificateDer::from(&root_der_buf[..root_der_len]);
+        let trust_anchor = anchor_from_trusted_cert(&root_cert_der)
+            .map_err(|e| AppAttestError::Message(format!("invalid root cert: {}", e)))?;
 
-        let mut cert_chain = Stack::new()
-            .map_err(|e| AppAttestError::Message(format!("Failed to create cert stack: {}", e)))?;
-        for cert in certs.iter().skip(1) {
-            cert_chain.push(cert.to_owned()).map_err(|e| {
-                AppAttestError::Message(format!("Failed to push cert to stack: {}", e))
-            })?;
-        }
+        let leaf_der = CertificateDer::from(certificates[0]);
+        let intermediates: Vec<CertificateDer<'_>> = certificates[1..]
+            .iter()
+            .map(|c| CertificateDer::from(*c))
+            .collect();
 
-        let mut context = X509StoreContext::new().map_err(|e| {
-            AppAttestError::Message(format!("Failed to create X509 store context: {}", e))
-        })?;
-        context
-            .init(&store, &certs[0], &cert_chain, |ctx| {
-                ctx.verify_cert()?;
-                Ok(())
-            })
-            .map_err(|e| {
-                AppAttestError::Message(format!("Certificate chain verification failed: {}", e))
-            })?;
+        let leaf = EndEntityCert::try_from(&leaf_der)
+            .map_err(|e| AppAttestError::Message(format!("invalid leaf cert: {}", e)))?;
+
+        leaf.verify_for_usage(
+            ALL_VERIFICATION_ALGS,
+            &[trust_anchor],
+            &intermediates,
+            UnixTime::now(),
+            WebpkiKeyUsage::client_auth(),
+            None,
+            None,
+        )
+        .map_err(|e| AppAttestError::Message(format!("cert chain verification failed: {}", e)))?;
 
         Ok(())
     }
@@ -275,60 +315,38 @@ impl<'a> Attestation<'a> {
 
     /// Creates a SHA-256 hash of the challenge string.
     fn client_data_hash(challenge: &str) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(challenge.as_bytes());
-        hasher.finish().into()
+        Sha256::digest(challenge.as_bytes()).into()
     }
 
     /// Creates a SHA-256 hash of authData concatenated with clientDataHash.
     fn nonce_hash(auth_data: &[u8], client_data_hash: [u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(auth_data);
-        hasher.update(&client_data_hash);
-        hasher.finish().into()
+        hasher.update(client_data_hash);
+        hasher.finalize().into()
     }
 
     fn verify_public_key_hash(
-        cert: &X509,
+        cert_der: &[u8],
         key_identifier: &[u8],
     ) -> Result<([u8; 65], bool), AppAttestError> {
-        let pub_key_bytes = Self::_extract_client_pub_key_bytes(cert)?;
-        let pub_key_hash = hash(MessageDigest::sha256(), &pub_key_bytes)
-            .map_err(|e| AppAttestError::Message(format!("SHA-256 hash failed: {}", e)))?;
+        let pub_key_bytes = Self::_extract_client_pub_key_bytes(cert_der)?;
+        let pub_key_hash: [u8; 32] = Sha256::digest(&pub_key_bytes).into();
         Ok((pub_key_bytes, pub_key_hash.as_ref() == key_identifier))
     }
 
-    fn _extract_client_pub_key_bytes(cert: &X509) -> Result<[u8; 65], AppAttestError> {
-        let public_key = cert
-            .public_key()
-            .map_err(|e| AppAttestError::Message(format!("Failed to get public key: {}", e)))?;
-        let ecdsa_key = public_key
-            .ec_key()
-            .map_err(|e| AppAttestError::Message(format!("Failed to get EC key: {}", e)))?;
-        let ec_point = ecdsa_key.public_key();
-        let group = ecdsa_key.group();
-
-        let mut ctx = BigNumContext::new().map_err(|e| {
-            AppAttestError::Message(format!("Failed to create BigNumContext: {}", e))
-        })?;
-        let pub_key_vec = ec_point
-            .to_bytes(group, PointConversionForm::UNCOMPRESSED, &mut ctx)
-            .map_err(|e| AppAttestError::Message(format!("Failed to export EC point: {}", e)))?;
-
-        pub_key_vec.as_slice().try_into().map_err(|_| {
-            AppAttestError::Message(format!(
-                "expected 65-byte EC point, got {}",
-                pub_key_vec.len()
-            ))
+    fn _extract_client_pub_key_bytes(cert_der: &[u8]) -> Result<[u8; 65], AppAttestError> {
+        let (_, cert) = parse_x509_certificate(cert_der)
+            .map_err(|_| AppAttestError::Message("Failed to parse certificate".to_string()))?;
+        let key_data = cert.tbs_certificate.subject_pki.subject_public_key.as_ref();
+        key_data.try_into().map_err(|_| {
+            AppAttestError::Message(format!("expected 65-byte EC point, got {}", key_data.len()))
         })
     }
 
     /// Extracts the credential public key bytes from the first certificate.
     pub fn extract_client_pub_key_bytes(&self) -> Result<[u8; 65], AppAttestError> {
-        let cred_cert = X509::from_der(self.certificates[0]).map_err(|e| {
-            AppAttestError::Message(format!("Failed to parse credential certificate: {}", e))
-        })?;
-        Self::_extract_client_pub_key_bytes(&cred_cert)
+        Self::_extract_client_pub_key_bytes(self.certificates[0])
     }
 
     /// Verify performs the complete attestation verification, fetching the
@@ -343,14 +361,9 @@ impl<'a> Attestation<'a> {
         challenge: &str,
         app_id: &str,
         key_id: &str,
+        apple_root_cert_pem: &[u8],
     ) -> Result<([u8; 65], Vec<u8>), AppAttestError> {
-        let apple_root_cert = Attestation::fetch_apple_root_cert(
-            "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem",
-        )?;
-        let cert_pem = apple_root_cert.to_pem().map_err(|e| {
-            AppAttestError::Message(format!("Failed to encode root cert as PEM: {}", e))
-        })?;
-        self.verify_with_cert(challenge, app_id, key_id, &cert_pem)
+        self.verify_with_cert(challenge, app_id, key_id, apple_root_cert_pem)
     }
 
     /// Verify performs the complete attestation verification using caller-supplied Apple root
@@ -369,11 +382,8 @@ impl<'a> Attestation<'a> {
         key_id: &str,
         apple_root_cert_pem: &[u8],
     ) -> Result<([u8; 65], Vec<u8>), AppAttestError> {
-        let apple_root_cert = X509::from_pem(apple_root_cert_pem)
-            .map_err(|e| AppAttestError::Message(format!("Failed to parse certificate: {}", e)))?;
-
         // Step 1: Verify Certificates
-        Attestation::verify_certificates(&self.certificates, &apple_root_cert)?;
+        Attestation::verify_certificates(&self.certificates, apple_root_cert_pem)?;
 
         // Step 2: Parse Authenticator Data
         let auth_data = AuthenticatorData::new(self.auth_data)?;
@@ -382,17 +392,13 @@ impl<'a> Attestation<'a> {
         let client_data_hash = Attestation::client_data_hash(challenge);
         let nonce = Attestation::nonce_hash(self.auth_data, client_data_hash);
 
-        let cred_cert = X509::from_der(self.certificates[0]).map_err(|e| {
-            AppAttestError::Message(format!("Failed to parse credential certificate: {}", e))
-        })?;
-
-        let key_id_decoded_bytes = general_purpose::STANDARD
+        let key_id_decoded_bytes: Vec<u8> = BASE64_STANDARD
             .decode(key_id)
             .map_err(|e| AppAttestError::Message(e.to_string()))?;
 
         // Step 4: Verify Public Key Hash
         let (public_key_bytes, hash_matches) =
-            Attestation::verify_public_key_hash(&cred_cert, &key_id_decoded_bytes)?;
+            Attestation::verify_public_key_hash(self.certificates[0], &key_id_decoded_bytes)?;
         if !hash_matches {
             return Err(AppAttestError::InvalidPublicKey);
         }
@@ -431,12 +437,9 @@ impl<'a> Attestation<'a> {
         app_ids: &[&'static str],
         key_id: &str,
     ) -> Result<(&'static str, [u8; 65], Vec<u8>), AppAttestError> {
-        let apple_root_cert = Attestation::fetch_apple_root_cert(
+        let cert_pem = Attestation::fetch_apple_root_cert(
             "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem",
         )?;
-        let cert_pem = apple_root_cert.to_pem().map_err(|e| {
-            AppAttestError::Message(format!("Failed to encode root cert as PEM: {}", e))
-        })?;
         self.app_id_verifies_with_cert(challenge, app_ids, key_id, &cert_pem)
     }
 
@@ -451,11 +454,8 @@ impl<'a> Attestation<'a> {
         key_id: &str,
         apple_root_cert_pem: &[u8],
     ) -> Result<(&'static str, [u8; 65], Vec<u8>), AppAttestError> {
-        let apple_root_cert = X509::from_pem(apple_root_cert_pem)
-            .map_err(|e| AppAttestError::Message(format!("Failed to parse certificate: {}", e)))?;
-
         // Step 1: Verify Certificates
-        Attestation::verify_certificates(&self.certificates, &apple_root_cert)?;
+        Attestation::verify_certificates(&self.certificates, apple_root_cert_pem)?;
 
         // Step 2: Parse Authenticator Data
         let auth_data = AuthenticatorData::new(self.auth_data)?;
@@ -464,17 +464,13 @@ impl<'a> Attestation<'a> {
         let client_data_hash = Attestation::client_data_hash(challenge);
         let nonce = Attestation::nonce_hash(self.auth_data, client_data_hash);
 
-        let cred_cert = X509::from_der(self.certificates[0]).map_err(|e| {
-            AppAttestError::Message(format!("Failed to parse credential certificate: {}", e))
-        })?;
-
-        let key_id_decoded_bytes = general_purpose::STANDARD
+        let key_id_decoded_bytes: Vec<u8> = BASE64_STANDARD
             .decode(key_id)
             .map_err(|e| AppAttestError::Message(e.to_string()))?;
 
         // Step 4: Verify Public Key Hash
         let (public_key_bytes, hash_matches) =
-            Attestation::verify_public_key_hash(&cred_cert, &key_id_decoded_bytes)?;
+            Attestation::verify_public_key_hash(self.certificates[0], &key_id_decoded_bytes)?;
         if !hash_matches {
             return Err(AppAttestError::InvalidPublicKey);
         }
@@ -523,25 +519,11 @@ mod tests {
         assert!(!attestation.auth_data.is_empty());
     }
 
+    #[cfg(feature = "testing")]
     #[test]
     fn test_verify_certificates_empty() {
-        let root_cert_pem = b"-----BEGIN CERTIFICATE-----\n\
-        MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMSYw\n\
-        JAYDVQQDDB1BcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQTETMBEGA1UECgwK\n\
-        QXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODMyNTNa\n\
-        Fw00NTAzMTUwMDAwMDBaMFIxJjAkBgNVBAMMHUFwcGxlIEFwcCBBdHRlc3RhdGlv\n\
-        biBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9y\n\
-        bmlhMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQIEVwTtT4dyctdh\n\
-        NbJhFs/Ii2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjqK9au\n\
-        Yen1mMEvRq9Sk3Jm5X8U62H+xTD3FE9TgS41o0IwQDAPBgNVHRMBAf8EBTADAQH/\n\
-        MB0GA1UdDgQWBBSskRBTM72+aEH/pwyp5frq5eWKoTAOBgNVHQ8BAf8EBAMCAQYw\n\
-        CgYIKoZIzj0EAwMDaAAwZQIwQgFGnByvsiVbpTKwSga0kP0e8EeDS4+sQmTvb7vn\n\
-        53O5+FRXgeLhpJ06ysC5PrOyAjEAp5U4xDgEgllF7En3VcE3iexZZtKeYnpqtijV\n\
-        oyFraWVIyd/dganmrduC1bmTBGwD\n\
-        -----END CERTIFICATE-----";
-
-        let root_cert = openssl::x509::X509::from_pem(root_cert_pem).unwrap();
-        let result = Attestation::verify_certificates(&[], &root_cert);
+        let root_cert_pem = crate::testing::TEST_ROOT_CA_CERT_PEM;
+        let result = Attestation::verify_certificates(&[], root_cert_pem);
         assert!(result.is_err());
     }
 }
