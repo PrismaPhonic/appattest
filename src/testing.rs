@@ -30,6 +30,7 @@
 //! via `der_unwrap_tag`, stripping the `04 20` OCTET STRING tag+length to yield
 //! the raw 32-byte nonce.
 
+use aws_lc_rs::digest::{digest, Context as DigestContext, SHA256};
 use base64::{engine::general_purpose, Engine};
 use byteorder::{BigEndian, ByteOrder};
 use ciborium::{cbor, Value};
@@ -44,7 +45,6 @@ use openssl::{
     x509::{extension::BasicConstraints, X509Builder, X509NameBuilder, X509},
 };
 use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
-use sha2::{Digest, Sha256 as Sha256Digest};
 
 /// PEM bytes of the test root CA certificate (P-384).
 /// Pass this to `verify_with_cert` / `app_id_verifies_with_cert` in tests.
@@ -135,7 +135,10 @@ pub fn build_test_attestation(challenge: &str, app_id: &str) -> TestAttestation 
     //   [37..53] aaguid      = b"appattest\0\0\0\0\0\0\0" (16 bytes)
     //   [53..55] cred_id_len = 32u16 big-endian
     //   [55..87] cred_id     = key_id raw bytes
-    let rp_id_hash: [u8; 32] = Sha256Digest::digest(app_id.as_bytes()).into();
+    let rp_id_hash: [u8; 32] = digest(&SHA256, app_id.as_bytes())
+        .as_ref()
+        .try_into()
+        .unwrap();
     let mut aaguid = [0u8; 16];
     aaguid[..9].copy_from_slice(b"appattest");
 
@@ -150,12 +153,15 @@ pub fn build_test_attestation(challenge: &str, app_id: &str) -> TestAttestation 
     auth_data.extend_from_slice(&key_id_bytes);
 
     // nonce = SHA256(authData || SHA256(challenge))
-    let client_data_hash: [u8; 32] = Sha256Digest::digest(challenge.as_bytes()).into();
+    let client_data_hash: [u8; 32] = digest(&SHA256, challenge.as_bytes())
+        .as_ref()
+        .try_into()
+        .unwrap();
     let nonce: [u8; 32] = {
-        let mut h = sha2::Sha256::new();
-        sha2::Digest::update(&mut h, &auth_data);
-        sha2::Digest::update(&mut h, client_data_hash);
-        sha2::Digest::finalize(h).into()
+        let mut ctx = DigestContext::new(&SHA256);
+        ctx.update(&auth_data);
+        ctx.update(&client_data_hash);
+        ctx.finish().as_ref().try_into().unwrap()
     };
 
     let cred_cert_der = build_cred_cert(&device_pkey, nonce.as_slice(), &key_id);
@@ -185,7 +191,10 @@ pub fn build_test_assertion(
     previous_counter: u32,
     device_key: &SigningKey,
 ) -> Vec<u8> {
-    let rp_id_hash: [u8; 32] = Sha256Digest::digest(app_id.as_bytes()).into();
+    let rp_id_hash: [u8; 32] = digest(&SHA256, app_id.as_bytes())
+        .as_ref()
+        .try_into()
+        .unwrap();
     let counter = previous_counter + 1;
 
     let mut auth_data = Vec::with_capacity(37);
@@ -196,10 +205,10 @@ pub fn build_test_assertion(
     auth_data.extend_from_slice(&counter_bytes);
 
     let nonce: Vec<u8> = {
-        let mut h = sha2::Sha256::new();
-        sha2::Digest::update(&mut h, &auth_data);
-        sha2::Digest::update(&mut h, client_data_hash.as_ref());
-        sha2::Digest::finalize(h).to_vec()
+        let mut ctx = DigestContext::new(&SHA256);
+        ctx.update(&auth_data);
+        ctx.update(client_data_hash.as_ref());
+        ctx.finish().as_ref().to_vec()
     };
 
     let sig: DerSignature = device_key.sign(&nonce);
@@ -327,7 +336,7 @@ mod tests {
     #[test]
     fn round_trip_assertion() {
         let challenge = "test_challenge_12345";
-        let client_data_hash = Sha256Digest::digest(b"some payload").to_vec();
+        let client_data_hash = digest(&SHA256, b"some payload").as_ref().to_vec();
 
         let ta = build_test_attestation(challenge, TEST_APP_ID);
         let b64 = general_purpose::STANDARD.encode(&ta.cbor);

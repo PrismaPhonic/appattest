@@ -6,7 +6,7 @@ use reqwest::blocking::Client;
 use std::time::Duration;
 
 use arrayvec::ArrayVec;
-use sha2::{Digest, Sha256};
+use aws_lc_rs::digest::{digest, Context as DigestContext, SHA256};
 use x509_parser::prelude::*;
 // Use der_parser re-exported by x509_parser (der-parser v10, asn1-rs v0.7.1).
 // Importing directly avoids a version conflict with the older der-parser that
@@ -315,15 +315,18 @@ impl<'a> Attestation<'a> {
 
     /// Creates a SHA-256 hash of the challenge string.
     fn client_data_hash(challenge: &str) -> [u8; 32] {
-        Sha256::digest(challenge.as_bytes()).into()
+        digest(&SHA256, challenge.as_bytes())
+            .as_ref()
+            .try_into()
+            .unwrap()
     }
 
     /// Creates a SHA-256 hash of authData concatenated with clientDataHash.
     fn nonce_hash(auth_data: &[u8], client_data_hash: [u8; 32]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(auth_data);
-        hasher.update(client_data_hash);
-        hasher.finalize().into()
+        let mut ctx = DigestContext::new(&SHA256);
+        ctx.update(auth_data);
+        ctx.update(&client_data_hash);
+        ctx.finish().as_ref().try_into().unwrap()
     }
 
     fn verify_public_key_hash(
@@ -331,7 +334,7 @@ impl<'a> Attestation<'a> {
         key_identifier: &[u8],
     ) -> Result<([u8; 65], bool), AppAttestError> {
         let pub_key_bytes = Self::_extract_client_pub_key_bytes(cert_der)?;
-        let pub_key_hash: [u8; 32] = Sha256::digest(&pub_key_bytes).into();
+        let pub_key_hash: [u8; 32] = digest(&SHA256, &pub_key_bytes).as_ref().try_into().unwrap();
         Ok((pub_key_bytes, pub_key_hash.as_ref() == key_identifier))
     }
 

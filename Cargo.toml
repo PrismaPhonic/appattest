@@ -12,7 +12,6 @@ description = "A Rust module for validating Apple App Attestations and Assertion
 
 [dependencies]
 byteorder = "1.5"
-sha2 = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
 base64 = "0.22"
 openssl = { version = "0.10", optional = true }

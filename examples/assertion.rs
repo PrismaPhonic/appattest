@@ -1,6 +1,6 @@
 use appattest_rs::assertion::Assertion;
+use aws_lc_rs::digest::{digest, SHA256};
 use base64::{engine::general_purpose, Engine};
-use sha2::{Digest, Sha256};
 
 fn main() {
     // The JSON client data sent by the client (before hashing).
@@ -23,7 +23,7 @@ fn main() {
     let assertion_result = Assertion::from_base64(base64_cbor_data, &mut buf);
 
     // 1. Compute clientDataHash as the SHA256 hash of clientData.
-    let client_data_hash = Sha256::digest(client_data_json);
+    let client_data_hash = digest(&SHA256, client_data_json);
 
     match assertion_result {
         Ok(assertion) => {

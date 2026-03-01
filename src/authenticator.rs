@@ -1,6 +1,6 @@
 use crate::error::AppAttestError;
+use aws_lc_rs::digest::{digest, SHA256};
 use byteorder::{BigEndian, ByteOrder};
-use sha2::{Digest, Sha256};
 
 const APP_ATTEST: &[u8] = b"appattest";
 const APP_ATTEST_DEVELOP: &[u8] = b"appattestdevelop";
@@ -77,8 +77,8 @@ impl<'a> AuthenticatorData<'a> {
     }
 
     pub(crate) fn verify_app_id(&self, app_id: &str) -> Result<(), AppAttestError> {
-        let hash = Sha256::digest(app_id.as_bytes());
-        if self.rp_id_hash != hash.as_slice() {
+        let hash = digest(&SHA256, app_id.as_bytes());
+        if self.rp_id_hash != hash.as_ref() {
             Err(AppAttestError::InvalidAppID)
         } else {
             Ok(())
@@ -166,10 +166,13 @@ mod tests {
     #[test]
     fn test_verify_app_id() {
         let app_id = "app.apple.connect";
-        let hash = Sha256::digest(app_id.as_bytes());
+        let hash: [u8; 32] = digest(&SHA256, app_id.as_bytes())
+            .as_ref()
+            .try_into()
+            .unwrap();
 
         let auth_data = AuthenticatorData {
-            rp_id_hash: hash.into(),
+            rp_id_hash: hash,
             flags: 0,
             counter: 0,
             aaguid: None,

@@ -1,7 +1,9 @@
 use crate::{authenticator::AuthenticatorData, error::AppAttestError};
-use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+use aws_lc_rs::{
+    digest::{Context as DigestContext, SHA256},
+    signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1},
+};
 use base64::{engine::general_purpose, Engine};
-use sha2::{Digest, Sha256};
 
 const AUTHENTICATOR_DATA_LEN: usize = 37;
 
@@ -107,14 +109,14 @@ impl<'a> Assertion<'a> {
         // 2. Compute nonce = SHA256(authenticatorData || clientDataHash).
         // The device signs nonce via p256::Signer which hashes its input again (SHA256(nonce)),
         // so we pass nonce to aws-lc-rs ECDSA_P256_SHA256_ASN1 which also applies SHA256 once.
-        let mut hasher = Sha256::new();
-        hasher.update(self.raw_authenticator_data);
-        hasher.update(client_data_hash.as_ref());
-        let nonce = hasher.finalize();
+        let mut ctx = DigestContext::new(&SHA256);
+        ctx.update(self.raw_authenticator_data);
+        ctx.update(client_data_hash.as_ref());
+        let nonce = ctx.finish();
 
         // 3. Verify that the assertion's signature is valid for nonce.
         let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key_byte.as_ref());
-        if public_key.verify(&nonce, self.signature).is_err() {
+        if public_key.verify(nonce.as_ref(), self.signature).is_err() {
             return Err(AppAttestError::InvalidSignature);
         }
 
@@ -150,14 +152,14 @@ impl<'a> Assertion<'a> {
         // 2. Compute nonce = SHA256(authenticatorData || clientDataHash).
         // The device signs nonce via p256::Signer which hashes its input again (SHA256(nonce)),
         // so we pass nonce to aws-lc-rs ECDSA_P256_SHA256_ASN1 which also applies SHA256 once.
-        let mut hasher = Sha256::new();
-        hasher.update(self.raw_authenticator_data);
-        hasher.update(client_data_hash.as_ref());
-        let nonce = hasher.finalize();
+        let mut ctx = DigestContext::new(&SHA256);
+        ctx.update(self.raw_authenticator_data);
+        ctx.update(client_data_hash.as_ref());
+        let nonce = ctx.finish();
 
         // 3. Verify that the assertion's signature is valid for nonce.
         let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key_byte.as_ref());
-        if public_key.verify(&nonce, self.signature).is_err() {
+        if public_key.verify(nonce.as_ref(), self.signature).is_err() {
             return Err(AppAttestError::InvalidSignature);
         }
 
