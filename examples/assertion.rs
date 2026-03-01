@@ -1,17 +1,12 @@
 use appattest_rs::assertion::Assertion;
 use base64::{engine::general_purpose, Engine};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-#[derive(Deserialize)]
-struct ClientData {
-    challenge: String,
-}
-
 fn main() {
+    // The JSON client data sent by the client (before hashing).
     let client_data_json = r#"{"challenge": "5b3b2303-e650-4a56-a9ec-33e3e2a90d14"}"#
-        .as_bytes()
-        .to_vec();
+        .as_bytes();
+    let challenge = "5b3b2303-e650-4a56-a9ec-33e3e2a90d14";
     let app_id = "<APPLE_TEAM_ID>.<APPLE_APP_ID>"; // replace this with yours. E.g 9000738UU8.auth.iphone.com
     let public_key_base64 =
         "BLROJkpk8NoHVHAnkLOKWUrc4MhyMkATpDyDwjEk82o+uf+KCQiDoHZdlcJ1ff5HPgK7Jd/pTA3cyKOq5MYM6Gs=";
@@ -26,18 +21,15 @@ fn main() {
     // Convert from base64 CBOR to Assertion
     let mut buf = [0u8; 192];
     let assertion_result = Assertion::from_base64(base64_cbor_data, &mut buf);
-    let client_data = serde_json::from_slice::<ClientData>(&client_data_json).unwrap();
 
     // 1. Compute clientDataHash as the SHA256 hash of clientData.
-    let mut hasher = Sha256::new();
-    hasher.update(&client_data_json);
-    let client_data_hash = hasher.finalize();
+    let client_data_hash = Sha256::digest(client_data_json);
 
     match assertion_result {
         Ok(assertion) => {
             match assertion.verify(
                 client_data_hash,
-                &client_data.challenge,
+                challenge,
                 app_id,
                 public_key_byte,
                 previous_counter,

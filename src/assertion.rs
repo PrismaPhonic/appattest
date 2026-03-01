@@ -1,6 +1,6 @@
 use crate::{authenticator::AuthenticatorData, error::AppAttestError};
+use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
 use base64::{engine::general_purpose, Engine};
-use p256::ecdsa::{self, signature::Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 const AUTHENTICATOR_DATA_LEN: usize = 37;
@@ -104,23 +104,17 @@ impl<'a> Assertion<'a> {
     ) -> Result<(), AppAttestError> {
         let auth_data = AuthenticatorData::new(self.raw_authenticator_data)?;
 
-        let verifying_key = VerifyingKey::from_sec1_bytes(public_key_byte.as_ref())
-            .map_err(|_| AppAttestError::Message("failed to parse the public key".to_string()))?;
-
-        // 2. Concatenate authenticatorData and clientDataHash, and apply a SHA256 hash over the result to form nonce.
+        // 2. Compute nonce = SHA256(authenticatorData || clientDataHash).
+        // The device signs nonce via p256::Signer which hashes its input again (SHA256(nonce)),
+        // so we pass nonce to aws-lc-rs ECDSA_P256_SHA256_ASN1 which also applies SHA256 once.
         let mut hasher = Sha256::new();
         hasher.update(self.raw_authenticator_data);
         hasher.update(client_data_hash.as_ref());
-        let nonce_hash = hasher.finalize();
-
-        let signature = ecdsa::Signature::from_der(self.signature)
-            .map_err(|_| AppAttestError::Message("invalid signature format".to_string()))?;
+        let nonce = hasher.finalize();
 
         // 3. Verify that the assertion's signature is valid for nonce.
-        if verifying_key
-            .verify(nonce_hash.as_slice(), &signature)
-            .is_err()
-        {
+        let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key_byte.as_ref());
+        if public_key.verify(&nonce, self.signature).is_err() {
             return Err(AppAttestError::InvalidSignature);
         }
 
@@ -153,23 +147,17 @@ impl<'a> Assertion<'a> {
     ) -> Result<&'static str, AppAttestError> {
         let auth_data = AuthenticatorData::new(self.raw_authenticator_data)?;
 
-        let verifying_key = VerifyingKey::from_sec1_bytes(public_key_byte.as_ref())
-            .map_err(|_| AppAttestError::Message("failed to parse the public key".to_string()))?;
-
-        // 2. Concatenate authenticatorData and clientDataHash, and apply a SHA256 hash over the result to form nonce.
+        // 2. Compute nonce = SHA256(authenticatorData || clientDataHash).
+        // The device signs nonce via p256::Signer which hashes its input again (SHA256(nonce)),
+        // so we pass nonce to aws-lc-rs ECDSA_P256_SHA256_ASN1 which also applies SHA256 once.
         let mut hasher = Sha256::new();
         hasher.update(self.raw_authenticator_data);
         hasher.update(client_data_hash.as_ref());
-        let nonce_hash = hasher.finalize();
-
-        let signature = ecdsa::Signature::from_der(self.signature)
-            .map_err(|_| AppAttestError::Message("invalid signature format".to_string()))?;
+        let nonce = hasher.finalize();
 
         // 3. Verify that the assertion's signature is valid for nonce.
-        if verifying_key
-            .verify(nonce_hash.as_slice(), &signature)
-            .is_err()
-        {
+        let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key_byte.as_ref());
+        if public_key.verify(&nonce, self.signature).is_err() {
             return Err(AppAttestError::InvalidSignature);
         }
 

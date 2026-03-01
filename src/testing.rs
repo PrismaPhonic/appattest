@@ -317,8 +317,9 @@ mod tests {
         let challenge = "test_challenge_12345";
         let ta = build_test_attestation(challenge, TEST_APP_ID);
         let b64 = general_purpose::STANDARD.encode(&ta.cbor);
-        let attestation = Attestation::from_base64(&b64).expect("from_base64 failed");
-        attestation
+        let cbor = Attestation::decode_base64(&b64).expect("decode_base64 failed");
+        Attestation::from_cbor_bytes(&cbor)
+            .expect("from_cbor_bytes failed")
             .app_id_verifies_with_cert(challenge, &[TEST_APP_ID], &ta.key_id, TEST_ROOT_CA_CERT_PEM)
             .expect("app_id_verifies_with_cert failed");
     }
@@ -330,7 +331,8 @@ mod tests {
 
         let ta = build_test_attestation(challenge, TEST_APP_ID);
         let b64 = general_purpose::STANDARD.encode(&ta.cbor);
-        let pub_key_bytes = Attestation::from_base64(&b64)
+        let cbor = Attestation::decode_base64(&b64).unwrap();
+        let pub_key_bytes = Attestation::from_cbor_bytes(&cbor)
             .unwrap()
             .extract_client_pub_key_bytes()
             .unwrap();
