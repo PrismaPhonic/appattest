@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use arrayvec::ArrayVec;
 use aws_lc_rs::digest::{digest, Context as DigestContext, SHA256};
-use x509_parser::prelude::*;
 
 use rustls_pki_types::{CertificateDer, UnixTime};
 use webpki::{
@@ -414,15 +413,62 @@ impl<'a> Attestation<'a> {
         cert_der: &[u8],
         key_identifier: &[u8],
     ) -> Result<([u8; 65], bool), AppAttestError> {
-        let pub_key_bytes = Self::_extract_client_pub_key_bytes(cert_der)?;
+        let pub_key_bytes = Self::extract_pub_key_from_cert_der(cert_der)?;
         let pub_key_hash: [u8; 32] = digest(&SHA256, &pub_key_bytes).as_ref().try_into().unwrap();
         Ok((pub_key_bytes, pub_key_hash.as_ref() == key_identifier))
     }
 
-    fn _extract_client_pub_key_bytes(cert_der: &[u8]) -> Result<[u8; 65], AppAttestError> {
-        let (_, cert) = parse_x509_certificate(cert_der)
-            .map_err(|_| AppAttestError::Message("Failed to parse certificate".to_string()))?;
-        let key_data = cert.tbs_certificate.subject_pki.subject_public_key.as_ref();
+    /// Walk the DER TBSCertificate and return the raw EC public key bytes from
+    /// the SubjectPublicKeyInfo (the 5th SEQUENCE field, after signature,
+    /// issuer, validity, and subject). Returns the BIT STRING contents minus
+    /// the leading unused-bits byte - i.e., the 65-byte uncompressed EC point
+    /// for P-256 keys.
+    ///
+    /// all returned bytes are borrowed from `cert_der`.
+    fn der_extract_spki_key_bytes(cert_der: &[u8]) -> Option<&[u8]> {
+        // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { ... } ... }
+        let cert_seq = der_unwrap_tag(cert_der, 0x30)?;
+        let tbs_seq = der_unwrap_tag(cert_seq, 0x30)?;
+
+        let mut pos = 0;
+        let mut seq_count = 0u8;
+
+        while pos < tbs_seq.len() {
+            let tag = *tbs_seq.get(pos)?;
+            let (len, consumed) = der_read_len(tbs_seq, pos + 1)?;
+            let value_start = pos + 1 + consumed;
+            let value_end = value_start + len;
+            if value_end > tbs_seq.len() {
+                return None;
+            }
+            if tag == 0x30 {
+                seq_count += 1;
+                if seq_count == 5 {
+                    // SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier,
+                    // BIT STRING }
+                    let spki = &tbs_seq[value_start..value_end];
+                    // Skip the AlgorithmIdentifier SEQUENCE.
+                    if spki.first()? != &0x30 {
+                        return None;
+                    }
+                    let (ai_len, ai_consumed) = der_read_len(spki, 1)?;
+                    let ai_end = 1 + ai_consumed + ai_len;
+                    // Read the BIT STRING that follows.
+                    let rest = spki.get(ai_end..)?;
+                    let bit_str = der_unwrap_tag(rest, 0x03)?;
+                    // Drop the leading unused-bits byte (always 0x00 for EC keys).
+                    return bit_str.get(1..);
+                }
+            }
+            pos = value_end;
+        }
+        None
+    }
+
+    fn extract_pub_key_from_cert_der(cert_der: &[u8]) -> Result<[u8; 65], AppAttestError> {
+        let key_data = Self::der_extract_spki_key_bytes(cert_der).ok_or(
+            AppAttestError::Message("Failed to extract public key from certificate".to_string()),
+        )?;
         key_data.try_into().map_err(|_| {
             AppAttestError::Message(format!("expected 65-byte EC point, got {}", key_data.len()))
         })
@@ -430,7 +476,7 @@ impl<'a> Attestation<'a> {
 
     /// Extracts the credential public key bytes from the first certificate.
     pub fn extract_client_pub_key_bytes(&self) -> Result<[u8; 65], AppAttestError> {
-        Self::_extract_client_pub_key_bytes(self.certificates[0])
+        Self::extract_pub_key_from_cert_der(self.certificates[0])
     }
 
     /// Verify performs the complete attestation verification, fetching the
@@ -445,9 +491,11 @@ impl<'a> Attestation<'a> {
         challenge: &str,
         app_id: &str,
         key_id: &str,
-        apple_root_cert_pem: &[u8],
     ) -> Result<([u8; 65], &'a [u8]), AppAttestError> {
-        self.verify_with_cert(challenge, app_id, key_id, apple_root_cert_pem)
+        let cert_pem = Attestation::fetch_apple_root_cert(
+            "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem",
+        )?;
+        self.verify_with_cert(challenge, app_id, key_id, &cert_pem)
     }
 
     /// Verify performs the complete attestation verification using caller-supplied Apple root
