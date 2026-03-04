@@ -1,14 +1,14 @@
 [package]
-name = "appattest-rs"
-license = "MIT"
-edition = "2021"
-author = ["Ayodeji Akinola <akinayodeji4all@gmail.com>"]
-repository = "https://github.com/TheDhejavu/appattest-rs"
+name = "appattest"
 version = "0.1.0"
+edition = "2021"
+authors = ["Peter Farr <Peter@PrismaPhonic.com>"]
+license = "MIT"
+repository = "https://github.com/PrismaPhonic/appattest"
 readme = "README.md"
-description = "A Rust module for validating Apple App Attestations and Assertions"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Verification of Apple App Attestations and Assertions, to help enforce iOS App Integrity Checks"
+keywords = ["apple", "appattest", "ios", "attestation", "devicecheck"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 byteorder = "1.5"
