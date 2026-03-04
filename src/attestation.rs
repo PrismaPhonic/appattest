@@ -1,9 +1,5 @@
 use crate::{authenticator::AuthenticatorData, error::AppAttestError};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
-#[cfg(feature = "reqwest")]
-use reqwest::blocking::Client;
-#[cfg(feature = "reqwest")]
-use std::time::Duration;
 
 use arrayvec::ArrayVec;
 use aws_lc_rs::digest::{digest, Context as DigestContext, SHA256};
@@ -15,6 +11,39 @@ use webpki::{
 
 const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 const PEM_END: &str = "-----END CERTIFICATE-----";
+
+/// The URL of Apple's App Attestation Root CA certificate PEM.
+pub const APPLE_ROOT_CERT_URL: &str =
+    "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem";
+
+/// Fetches the Apple App Attestation Root CA certificate PEM bytes from Apple's servers.
+///
+/// The returned bytes can be passed directly to [`Attestation::verify`] or
+/// [`Attestation::app_id_verifies`]. Cache the result to avoid a network
+/// round-trip on every verification.
+#[cfg(feature = "reqwest")]
+pub fn fetch_apple_root_cert_pem() -> Result<Vec<u8>, AppAttestError> {
+    use reqwest::blocking::Client;
+    use std::time::Duration;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppAttestError::Message(format!("Failed to build HTTP client: {}", e)))?;
+    let response = client
+        .get(APPLE_ROOT_CERT_URL)
+        .send()
+        .map_err(|e| AppAttestError::Message(format!("Network request failed: {}", e)))?;
+    if !response.status().is_success() {
+        return Err(AppAttestError::Message(format!(
+            "Failed to fetch root cert: HTTP {}",
+            response.status()
+        )));
+    }
+    response
+        .bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| AppAttestError::Message(format!("Failed to read response body: {}", e)))
+}
 
 /// Read a DER TLV length field starting at `buf[pos]`.
 /// Returns `(length, bytes_consumed)` or `None` if the buffer is too short.
@@ -258,32 +287,6 @@ impl<'a> Attestation<'a> {
         Self::from_cbor(cbor)
     }
 
-    /// Fetches the Apple root certificate from the specified URL.
-    #[cfg(feature = "reqwest")]
-    fn fetch_apple_root_cert(url: &str) -> Result<Vec<u8>, AppAttestError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AppAttestError::Message(format!("Failed to build HTTP client: {}", e)))?;
-
-        let response = client
-            .get(url)
-            .send()
-            .map_err(|e| AppAttestError::Message(format!("Network request failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(AppAttestError::Message(format!(
-                "Failed to fetch: HTTP Status: {}",
-                response.status()
-            )));
-        }
-
-        response
-            .bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| AppAttestError::Message(format!("Failed to read response body: {}", e)))
-    }
-
     /// Decode a single PEM certificate into DER bytes on the stack.
     ///
     /// Returns a `([u8; MAX_ROOT_DER_SIZE], usize)` pair; use `&buf[..len]`
@@ -479,35 +482,12 @@ impl<'a> Attestation<'a> {
         Self::extract_pub_key_from_cert_der(self.certificates[0])
     }
 
-    /// Verify performs the complete attestation verification, fetching the
-    /// Apple root certificate automatically on each call.
+    /// Verifies the attestation using caller-supplied root certificate PEM bytes.
     ///
-    /// If you want to avoid the network round-trip on every verification, use
-    /// [`verify_with_cert`](Self::verify_with_cert) and supply the cached PEM
-    /// bytes yourself.
-    #[cfg(feature = "reqwest")]
+    /// Fetch the root cert once with [`fetch_apple_root_cert_pem`] (requires the
+    /// `reqwest` feature) and cache it; pass the same bytes on every call.
+    /// Returns the device's public key bytes and the receipt on success.
     pub fn verify(
-        self,
-        challenge: &str,
-        app_id: &str,
-        key_id: &str,
-    ) -> Result<([u8; 65], &'a [u8]), AppAttestError> {
-        let cert_pem = Attestation::fetch_apple_root_cert(
-            "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem",
-        )?;
-        self.verify_with_cert(challenge, app_id, key_id, &cert_pem)
-    }
-
-    /// Verify performs the complete attestation verification using caller-supplied Apple root
-    /// certificate PEM bytes.
-    ///
-    /// This is the preferred entry point for production use: fetch (and cache) the Apple root
-    /// certificate once, then pass the raw PEM bytes here on every call to avoid a network
-    /// round-trip per verification.
-    ///
-    /// The current Apple App Attestation Root CA PEM can be obtained from:
-    /// `https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem`
-    pub fn verify_with_cert(
         self,
         challenge: &str,
         app_id: &str,
@@ -564,27 +544,9 @@ impl<'a> Attestation<'a> {
 
     /// If any of the supplied app IDs verifies, returns `(app_id, public_key_bytes, receipt)`.
     ///
-    /// Fetches the Apple root certificate automatically on each call. See
-    /// [`app_id_verifies_with_cert`](Self::app_id_verifies_with_cert) to supply the cert yourself
-    /// and avoid a network round-trip per call.
-    #[cfg(feature = "reqwest")]
+    /// Useful when supporting multiple bundle IDs or environments. Pass the root
+    /// cert PEM bytes obtained from [`fetch_apple_root_cert_pem`].
     pub fn app_id_verifies(
-        self,
-        challenge: &str,
-        app_ids: &[&'static str],
-        key_id: &str,
-    ) -> Result<(&'static str, [u8; 65], &'a [u8]), AppAttestError> {
-        let cert_pem = Attestation::fetch_apple_root_cert(
-            "https://www.apple.com/certificateauthority/Apple_App_Attestation_Root_CA.pem",
-        )?;
-        self.app_id_verifies_with_cert(challenge, app_ids, key_id, &cert_pem)
-    }
-
-    /// If any of the supplied app IDs verifies, returns `(app_id, public_key_bytes, receipt)`.
-    ///
-    /// Uses caller-supplied Apple root certificate PEM bytes so the caller can cache the cert and
-    /// avoid a network round-trip on every verification.
-    pub fn app_id_verifies_with_cert(
         self,
         challenge: &str,
         app_ids: &[&'static str],

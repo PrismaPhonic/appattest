@@ -6,8 +6,7 @@
 //!
 //! A static two-level CA is embedded here:
 //! - Root CA (P-384, self-signed) - pass [`TEST_ROOT_CA_CERT_PEM`] to
-//!   `verify_with_cert` / `app_id_verifies_with_cert` in place of the real
-//!   Apple root.
+//!   `verify` / `app_id_verifies` in place of the real Apple root.
 //! - Intermediate CA (P-256, signed by root) - used to sign per-call credential
 //!   certs, mirroring Apple's "App Attestation CA 1".
 //!
@@ -90,8 +89,8 @@ pub struct TestAttestation {
     /// `Attestation::from_base64`, or decode directly via
     /// `Attestation::from_cbor` if exposed.
     pub cbor: Vec<u8>,
-    /// Base64-encoded key ID (standard encoding). Pass to `verify_with_cert` /
-    /// `app_id_verifies_with_cert`.
+    /// Base64-encoded key ID (standard encoding). Pass to `verify` /
+    /// `app_id_verifies`.
     pub key_id: String,
     /// The device's P-256 private key. Keep this to sign assertions in
     /// subsequent calls.
@@ -101,8 +100,7 @@ pub struct TestAttestation {
 /// Build a fully valid synthetic attestation signed by the embedded test CA.
 ///
 /// The returned [`TestAttestation`] will pass
-/// `Attestation::app_id_verifies_with_cert(challenge, &[app_id], &key_id,
-/// TEST_ROOT_CA_CERT_PEM)`.
+/// `Attestation::app_id_verifies(challenge, &[app_id], &key_id, TEST_ROOT_CA_CERT_PEM)`.
 pub fn build_test_attestation(challenge: &str, app_id: &str) -> TestAttestation {
     // Generate a P-256 device keypair via openssl, then import the scalar into
     // p256 for signing.
@@ -328,7 +326,7 @@ mod tests {
         let cbor = Attestation::decode_base64(&b64).expect("decode_base64 failed");
         Attestation::from_cbor_bytes(&cbor)
             .expect("from_cbor_bytes failed")
-            .app_id_verifies_with_cert(challenge, &[TEST_APP_ID], &ta.key_id, TEST_ROOT_CA_CERT_PEM)
+            .app_id_verifies(challenge, &[TEST_APP_ID], &ta.key_id, TEST_ROOT_CA_CERT_PEM)
             .expect("app_id_verifies_with_cert failed");
     }
 
