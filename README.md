@@ -1,4 +1,10 @@
 # Appattest
+[![CI](https://img.shields.io/github/actions/workflow/status/PrismaPhonic/appattest/ci.yml?branch=main)](https://github.com/PrismaPhonic/appattest/actions)
+[![Crates.io](https://img.shields.io/crates/v/appattest.svg)](https://crates.io/crates/appattest)
+[![Docs](https://docs.rs/appattest/badge.svg)](https://docs.rs/appattest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![maintenance](https://img.shields.io/badge/maintenance-actively--developed-brightgreen)](https://github.com/PrismaPhonic/appattest)
+
 
 Verification of Apple App Attestations and Assertions for iOS apps that use
 [DeviceCheck App Attest](https://developer.apple.com/documentation/devicecheck). All
