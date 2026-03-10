@@ -9,6 +9,7 @@ pub enum AppAttestError {
     InvalidAAGUID,
     InvalidSignature,
     InvalidAppID,
+    InvalidFormat,
     ExpectedASN1Node,
     ExpectedOctetStringInsideASN1Node,
     AuthenticatorDataTooShort,
@@ -27,6 +28,9 @@ impl fmt::Display for AppAttestError {
             AppAttestError::InvalidAAGUID => write!(f, "invalid AAGUID"),
             AppAttestError::InvalidSignature => write!(f, "invalid signature"),
             AppAttestError::InvalidAppID => write!(f, "invalid App ID"),
+            AppAttestError::InvalidFormat => {
+                write!(f, "invalid attestation format (expected apple-appattest)")
+            }
             AppAttestError::ExpectedASN1Node => write!(f, "expected ASN1 node"),
             AppAttestError::ExpectedOctetStringInsideASN1Node => {
                 write!(f, "expected octet string inside ASN1 node")

@@ -42,8 +42,13 @@ impl<'a> AuthenticatorData<'a> {
             return Ok(());
         }
 
-        let length = BigEndian::read_u16(&bytes[53..55]) as usize;
-        let end = 55 + length;
+        // Apple App Attest credential IDs are always 32 bytes (SHA-256 of the
+        // public key). We intentionally ignore the credentialIdLength field at
+        // bytes [53..55] because some iOS versions (notably 26.x) write a
+        // non-standard value there while the actual credential ID remains 32
+        // bytes followed by a valid COSE key.
+        const CREDENTIAL_ID_LEN: usize = 32;
+        let end = 55 + CREDENTIAL_ID_LEN;
         if bytes.len() < end {
             return Err(AppAttestError::AuthenticatorDataTooShort);
         }

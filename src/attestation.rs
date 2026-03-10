@@ -3,14 +3,33 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 
 use arrayvec::ArrayVec;
 use aws_lc_rs::digest::{digest, Context as DigestContext, SHA256};
-
-use rustls_pki_types::{CertificateDer, UnixTime};
+use rustls_pki_types::{CertificateDer, TrustAnchor, UnixTime};
 use webpki::{
-    anchor_from_trusted_cert, EndEntityCert, KeyUsage as WebpkiKeyUsage, ALL_VERIFICATION_ALGS,
+    anchor_from_trusted_cert, EndEntityCert, ExtendedKeyUsageValidator, KeyPurposeIdIter,
 };
 
 const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 const PEM_END: &str = "-----END CERTIFICATE-----";
+
+/// Apple's spec says not to enforce Extended Key Usage. This validator
+/// accepts any EKU (or none at all).
+struct AnyEku;
+
+impl ExtendedKeyUsageValidator for AnyEku {
+    fn validate(&self, _iter: KeyPurposeIdIter<'_, '_>) -> Result<(), webpki::Error> {
+        Ok(())
+    }
+}
+
+/// Signature algorithms accepted during certificate chain verification.
+/// Apple uses ECDSA P-256/SHA-256 for leaf certs and ECDSA P-384/SHA-384
+/// for intermediate/root certs.
+static APPLE_SIG_ALGS: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] = &[
+    webpki::aws_lc_rs::ECDSA_P256_SHA256,
+    webpki::aws_lc_rs::ECDSA_P256_SHA384,
+    webpki::aws_lc_rs::ECDSA_P384_SHA256,
+    webpki::aws_lc_rs::ECDSA_P384_SHA384,
+];
 
 /// The URL of Apple's App Attestation Root CA certificate PEM.
 pub const APPLE_ROOT_CERT_URL: &str =
@@ -81,12 +100,9 @@ fn der_unwrap_tag(buf: &[u8], expected_tag: u8) -> Option<&[u8]> {
 ///
 /// Returns `None` if the extension is not present or the certificate cannot be parsed.
 fn der_find_extension<'a>(cert_der: &'a [u8], target_oid_bytes: &[u8]) -> Option<&'a [u8]> {
-    // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE { ... } ... }
     let cert_seq = der_unwrap_tag(cert_der, 0x30)?;
-    // TBSCertificate is the first item inside the outer SEQUENCE.
     let tbs_seq = der_unwrap_tag(cert_seq, 0x30)?;
 
-    // Walk TBSCertificate fields until we find the [3] EXPLICIT extensions tag (0xa3).
     let mut pos = 0;
     while pos < tbs_seq.len() {
         let tag = *tbs_seq.get(pos)?;
@@ -97,7 +113,6 @@ fn der_find_extension<'a>(cert_der: &'a [u8], target_oid_bytes: &[u8]) -> Option
             return None;
         }
         if tag == 0xa3 {
-            // Found [3] EXPLICIT - its contents are a SEQUENCE OF Extension.
             let exts_seq = der_unwrap_tag(&tbs_seq[value_start..value_end], 0x30)?;
             return der_scan_extensions(exts_seq, target_oid_bytes);
         }
@@ -111,18 +126,17 @@ fn der_find_extension<'a>(cert_der: &'a [u8], target_oid_bytes: &[u8]) -> Option
 fn der_scan_extensions<'a>(exts: &'a [u8], target_oid_bytes: &[u8]) -> Option<&'a [u8]> {
     let mut pos = 0;
     while pos < exts.len() {
-        // Each Extension is a SEQUENCE.
+        if exts.get(pos)? != &0x30 {
+            return None;
+        }
         let ext_seq = der_unwrap_tag(&exts[pos..], 0x30)?;
         let (len, consumed) = der_read_len(exts, pos + 1)?;
         let ext_end = pos + 1 + consumed + len;
 
-        // First field in Extension SEQUENCE is the OID.
         if ext_seq.first()? == &0x06 {
             let (oid_len, oid_consumed) = der_read_len(ext_seq, 1)?;
             let oid_bytes = ext_seq.get(1 + oid_consumed..1 + oid_consumed + oid_len)?;
             if oid_bytes == target_oid_bytes {
-                // Found it. The last field in the Extension SEQUENCE is the
-                // extnValue OCTET STRING. Unwrap it to get the raw value bytes.
                 let rest = &ext_seq[1 + oid_consumed + oid_len..];
                 // Skip optional critical BOOLEAN if present (tag 0x01).
                 let value_start = if rest.first() == Some(&0x01) {
@@ -167,6 +181,7 @@ impl<'a> Attestation<'a> {
         let mut certificates: Option<ArrayVec<&'a [u8], 3>> = None;
         let mut receipt: Option<&'a [u8]> = None;
         let mut auth_data: Option<&'a [u8]> = None;
+        let mut fmt_valid = false;
 
         let entries = map_len.unwrap_or(0);
         for _ in 0..entries {
@@ -174,6 +189,15 @@ impl<'a> Attestation<'a> {
                 AppAttestError::Message("expected string key in root map".to_string())
             })?;
             match key {
+                "fmt" => {
+                    let fmt = decoder.str().map_err(|_| {
+                        AppAttestError::Message("expected string for fmt".to_string())
+                    })?;
+                    if fmt != "apple-appattest" {
+                        return Err(AppAttestError::InvalidFormat);
+                    }
+                    fmt_valid = true;
+                }
                 "attStmt" => {
                     let stmt_len = decoder.map().map_err(|_| {
                         AppAttestError::Message("expected CBOR map for attStmt".to_string())
@@ -237,6 +261,9 @@ impl<'a> Attestation<'a> {
             }
         }
 
+        if !fmt_valid {
+            return Err(AppAttestError::InvalidFormat);
+        }
         let certificates = certificates
             .ok_or_else(|| AppAttestError::Message("missing x5c certificates".to_string()))?;
         if certificates.is_empty() {
@@ -326,42 +353,48 @@ impl<'a> Attestation<'a> {
         Ok((der_buf, written))
     }
 
-    /// Verifies the certificate chain in the attestation statement using rustls-webpki.
+    /// Verifies the certificate chain in the attestation statement using webpki.
     fn verify_certificates(
         certificates: &[&[u8]],
         apple_root_cert_pem: &[u8],
     ) -> Result<(), AppAttestError> {
-        if certificates.is_empty() {
-            return Err(AppAttestError::Message("certificates is empty".to_string()));
+        if certificates.len() < 2 {
+            return Err(AppAttestError::Message(
+                "need at least leaf + intermediate certificate".to_string(),
+            ));
         }
 
         let (root_der_buf, root_der_len) = Self::pem_to_der(apple_root_cert_pem)?;
-        let root_cert_der = CertificateDer::from(&root_der_buf[..root_der_len]);
-        let trust_anchor = anchor_from_trusted_cert(&root_cert_der)
-            .map_err(|e| AppAttestError::Message(format!("invalid root cert: {}", e)))?;
+        let root_der = &root_der_buf[..root_der_len];
+        let root_cert_der = CertificateDer::from(root_der);
+        let trust_anchor: TrustAnchor<'_> = anchor_from_trusted_cert(&root_cert_der)
+            .map_err(|e| AppAttestError::Message(format!("bad root cert: {e}")))?;
 
-        let leaf_der = CertificateDer::from(certificates[0]);
-        // At most 2 intermediates (Apple's chain: leaf + intermediate + root, root is the trust anchor).
+        // Stack-allocated intermediate cert references (at most 2 intermediates).
         let mut intermediates: ArrayVec<CertificateDer<'_>, 2> = ArrayVec::new();
-        for c in &certificates[1..] {
-            intermediates
-                .try_push(CertificateDer::from(*c))
-                .map_err(|_| AppAttestError::Message("too many intermediate certs".to_string()))?;
+        for &cert in &certificates[1..] {
+            if intermediates.try_push(CertificateDer::from(cert)).is_err() {
+                return Err(AppAttestError::Message(
+                    "too many intermediate certificates".to_string(),
+                ));
+            }
         }
 
-        let leaf = EndEntityCert::try_from(&leaf_der)
-            .map_err(|e| AppAttestError::Message(format!("invalid leaf cert: {}", e)))?;
+        let leaf_cert_der = CertificateDer::from(certificates[0]);
+        let ee_cert = EndEntityCert::try_from(&leaf_cert_der)
+            .map_err(|e| AppAttestError::Message(format!("bad leaf cert: {e}")))?;
 
-        leaf.verify_for_usage(
-            ALL_VERIFICATION_ALGS,
-            &[trust_anchor],
-            &intermediates,
-            UnixTime::now(),
-            WebpkiKeyUsage::client_auth(),
-            None,
-            None,
-        )
-        .map_err(|e| AppAttestError::Message(format!("cert chain verification failed: {}", e)))?;
+        ee_cert
+            .verify_for_usage(
+                APPLE_SIG_ALGS,
+                &[trust_anchor],
+                &intermediates,
+                UnixTime::now(),
+                AnyEku,
+                None,
+                None,
+            )
+            .map_err(|e| AppAttestError::Message(format!("cert chain verification failed: {e}")))?;
 
         Ok(())
     }

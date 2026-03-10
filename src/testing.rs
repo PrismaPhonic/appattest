@@ -41,7 +41,10 @@ use openssl::{
     nid::Nid,
     pkey::PKey,
     rand::rand_bytes,
-    x509::{extension::BasicConstraints, X509Builder, X509NameBuilder, X509},
+    x509::{
+        extension::{BasicConstraints, ExtendedKeyUsage},
+        X509Builder, X509NameBuilder, X509,
+    },
 };
 use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
 
@@ -253,6 +256,16 @@ fn build_cred_cert(
 
     builder
         .append_extension(BasicConstraints::new().build().unwrap())
+        .unwrap();
+
+    // Apple's proprietary App Attest EKU (OID 1.2.840.113635.100.4.24).
+    builder
+        .append_extension(
+            ExtendedKeyUsage::new()
+                .other("1.2.840.113635.100.4.24")
+                .build()
+                .unwrap(),
+        )
         .unwrap();
 
     // Nonce extension OID 1.2.840.113635.100.8.2, encoding:
